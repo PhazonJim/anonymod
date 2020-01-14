@@ -1,4 +1,7 @@
 import discord
+import yaml
+import os
+import praw
 
 #===Constants===#
 CONFIG_FILE = os.path.join(os.path.dirname(__file__),"config.yaml")
@@ -6,33 +9,49 @@ CACHE_FILE =  os.path.join(os.path.dirname(__file__), "cache.json")
 
 #===Globals===#
 #Config file
-config = None
-
+CONFIG = None
+REDDIT = None
 client = discord.Client()
-templates = {"1": "Test1", 
-             "2": "Test2",
-             "3": "Test3"}
 
 def loadConfig():
-    global config
+    global CONFIG
     #Load configs
     try:
-        config = yaml.load(open(CONFIG_FILE).read(), Loader=yaml.FullLoader)
+        CONFIG = yaml.load(open(CONFIG_FILE).read(), Loader=yaml.FullLoader)
     except:
         print("'config.yaml' could not be located. Please ensure 'config.example' has been renamed")
         exit()
 
-@client.event
-async def unpack_command(message):
-    action, url, reply = message.content.split(' ')
-    reply = templates[reply]
+def initReddit():
+    client = CONFIG["client"]
+    reddit = praw.Reddit(**client)
+    return reddit
 
-    response = ("If this was turned on, I would have:\n"
-                "Used following action: {}\n"
-                "On this comment: {}\n" 
-                "With this message: {}\n").format(action, url, reply)
-    print('hello')
-    await message.channel.send(response)
+def check_for_duplicate_comments(commentObj):
+    #Check top level comments in the submission object
+    #commentObj.comments.replace_more(limit=0)
+    for comment in commentObj.replies:
+        if comment.distinguished:
+            return True
+    return False
+
+def post_comment(permalink, reply_text):
+    try:
+        #get comment from URL
+        target_comment = REDDIT.comment(url=permalink)
+        target_comment.refresh()
+        #check for duplicate comment
+        if check_for_duplicate_comments(target_comment):
+            return {"status": False, "err": "This comment already has a moderator reply under it.", "child_comment": None}
+        #Leave a comment
+        child_comment = target_comment.reply(reply_text)
+        child_comment.mod.distinguish(how="yes",sticky=True)
+        child_comment.mod.lock()
+        return {"status": True, "child_comment": child_comment}
+    except Exception as e:
+        print (e)
+        #If anything bad happens, return back false
+        return {"status": False, "err": e, "child_comment": None}
 
 @client.event
 async def on_ready():
@@ -40,19 +59,34 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    await client.process_commands(message)
-
-@client.event
-async def process_commands(message):
     if message.author == client.user:
         return
 
     if message.content.startswith('$'):
-        await unpack_command(message)
-    else:
-        print(message.content)
+        await process_commands(message)
 
+@client.event
+async def process_commands(message):
+    url = ''
+    rule = ''
+    templates = CONFIG["reply_template"]
+    params = message.content.split(' ')
+    if params[0][0] == '$':
+        params[0] = params[0][1:]
+    if len(params[0]) <= 3:
+        rule, url = params
+    else:
+        url, rule = params
+    reply = templates[rule]
+    response = post_comment(url, reply)
+    if response["status"]:
+        mod_reply = response["child_comment"]
+        discord_message = ( "Link to offending comment: {}\nLink to mod reply {}").format(url, mod_reply.permalink)
+        await message.channel.send(discord_message)
+    else:
+        await message.channel.send(response["err"])
 
 loadConfig()
-
-client.run(config['discord_key'])
+REDDIT = initReddit()
+moderator = REDDIT.subreddit(CONFIG["subreddit"]).mod
+client.run(CONFIG['discord_key'])
